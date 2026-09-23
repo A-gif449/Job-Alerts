@@ -1,0 +1,18 @@
+{
+  "name": "job-alerts",
+  "version": "1.0.0",
+  "description": "Job notification subscription service with Firebase Auth login, free email via Gmail SMTP, free job data via Arbeitnow API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "better-sqlite3": "^11.3.0",
+    "nodemailer": "^6.9.14",
+    "node-cron": "^3.0.3",
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "firebase-admin": "^12.5.0"
+  }
+}
