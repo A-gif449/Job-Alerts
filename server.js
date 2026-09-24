@@ -480,12 +480,21 @@ app.get("/api/cron/check-daily", requireCronSecret, async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
-initDb()
-  .then(() => {
-    app.listen(PORT, () => console.log(`Job Alerts running on http://localhost:${PORT}`));
-  })
-  .catch((err) => {
-    console.error("❌ Failed to initialize database:", err.message);
-    process.exit(1);
-  });
+// Runs `node server.js` directly (local dev) -> start a real listening server.
+// Required as a module (Vercel's serverless runtime) -> just export the Express
+// app; Vercel wraps it as a request handler and manages the server lifecycle itself.
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  initDb()
+    .then(() => {
+      app.listen(PORT, () => console.log(`Job Alerts running on http://localhost:${PORT}`));
+    })
+    .catch((err) => {
+      console.error("❌ Failed to initialize database:", err.message);
+      process.exit(1);
+    });
+} else {
+  initDb().catch((err) => console.error("❌ Failed to initialize database:", err.message));
+}
+
+module.exports = app;
