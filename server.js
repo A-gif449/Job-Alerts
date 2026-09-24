@@ -1,51 +1,53 @@
 /**
  * Job Alerts — minimal full-stack job notification service
  * -----------------------------------------------------------
- * Free stack used:
- *  - Auth:          Firebase Authentication (email/password)
+ * Stack (Render + Neon deployment):
+ *  - Auth:          Firebase Authentication (email/password + phone OTP)
  *  - Notifications: Gmail SMTP via Nodemailer (100% free, ~500 emails/day limit)
  *  - Job data:      Arbeitnow public API (free, no key required)
- *  - Database:      SQLite file (zero setup, no external DB server)
- *  - Scheduler:      node-cron (free, in-process)
+ *  - Database:      Postgres (Neon free tier) — swapped from local SQLite because
+ *                    Render's free web service has an EPHEMERAL filesystem; a SQLite
+ *                    file would be wiped on every redeploy/restart.
+ *  - Scheduler:      Two secret-protected HTTP endpoints (/api/cron/check-instant,
+ *                    /api/cron/check-daily), triggered by a free external cron pinger
+ *                    (e.g. cron-job.org). This replaces node-cron, because Render's
+ *                    free tier spins the service down after 15 min of inactivity —
+ *                    an in-process scheduler can't fire while the process is asleep.
+ *                    The external pings also incidentally keep the service awake.
+ *  - Payments:      Stripe Checkout + Subscriptions (recurring ₹49/month)
  * server.js
- * Setup:
+ *
+ * Local dev setup:
  *  1. npm install
- *  2. Create a Firebase project -> Authentication -> Sign-in method -> enable Email/Password
- *  3. Firebase console -> Project settings -> Service accounts -> Generate new private key
- *     (this gives you FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY)
- *  4. Create a Gmail "App Password" (Google Account > Security > App Passwords)
- *  5. Copy .env.example to .env and fill in every value
- *  6. npm start
- *  7. Open http://localhost:3000
+ *  2. Set DATABASE_URL in .env to your Neon connection string (works fine locally too)
+ *  3. Everything else is the same as before — Firebase, Gmail, Stripe env vars
+ *  4. Add CRON_SECRET — any long random string, protects the two cron endpoints
+ *  5. npm start
  */
 
 const express = require("express");
-const Database = require("better-sqlite3");
+const { Pool } = require("pg");
 const nodemailer = require("nodemailer");
-const cron = require("node-cron");
 const axios = require("axios");
 const admin = require("firebase-admin");
 require("dotenv").config();
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.static("public"));
 
-// ---------- Firebase Admin (verifies ID tokens sent by the frontend) ----------
+// ---------- Firebase Admin ----------
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert({
       projectId: process.env.FIREBASE_PROJECT_ID,
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      // .env files can't hold real newlines, so the key is stored with literal \n and unescaped here
       privateKey: (process.env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
     }),
   });
 }
 
-// Verifies the "Authorization: Bearer <idToken>" header the frontend sends.
-// On success, req.user = { uid, email, ... } straight from Firebase — never trust
-// an email/uid coming from the request body instead of this.
 async function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization || "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
@@ -59,47 +61,66 @@ async function requireAuth(req, res, next) {
   }
 }
 
-// ---------- DB (SQLite, file-based, zero setup) ----------
-const db = new Database("job_alerts.db");
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT UNIQUE NOT NULL,
-    firebase_uid TEXT,
-    role_keywords TEXT NOT NULL,       -- comma separated, e.g. "frontend,react developer"
-    location TEXT DEFAULT '',           -- optional filter, blank = anywhere/remote
-    is_subscribed INTEGER DEFAULT 0,    -- 0 = free plan, 1 = paid plan (Rs 49/mo)
-    frequency TEXT DEFAULT 'daily',     -- 'instant' (paid only) or 'daily'
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS sent_jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    job_slug TEXT NOT NULL,
-    sent_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, job_slug)
-  );
-`);
-// Safe migration for databases created before firebase_uid existed.
-try { db.exec("ALTER TABLE users ADD COLUMN firebase_uid TEXT"); } catch (e) { /* column already exists */ }
-db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_firebase_uid ON users(firebase_uid) WHERE firebase_uid IS NOT NULL");
+function identityOf(reqUser) {
+  return reqUser.email || reqUser.phone_number || null;
+}
 
-// ---------- Email (free — Gmail SMTP) ----------
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_APP_PASSWORD,
-  },
+// Protects /api/cron/* from being triggered by anyone who finds the URL.
+function requireCronSecret(req, res, next) {
+  const provided = req.query.secret || req.headers["x-cron-secret"];
+  if (!process.env.CRON_SECRET || provided !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: "Invalid or missing cron secret." });
+  }
+  next();
+}
+
+// ---------- DB (Postgres — Neon free tier) ----------
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }, // required for Neon's connection
 });
 
-// Fail loudly at startup instead of silently at send-time — this is the #1 reason
-// "emails aren't arriving": wrong app password, 2FA not enabled, or typo in GMAIL_USER.
+async function initDb() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      firebase_uid TEXT,
+      role_keywords TEXT NOT NULL,
+      location TEXT DEFAULT '',
+      is_subscribed INTEGER DEFAULT 0,
+      frequency TEXT DEFAULT 'daily',
+      created_at TIMESTAMP DEFAULT NOW(),
+      stripe_customer_id TEXT,
+      stripe_subscription_id TEXT,
+      subscription_status TEXT DEFAULT 'none'
+    );
+  `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS sent_jobs (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      job_slug TEXT NOT NULL,
+      sent_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(user_id, job_slug)
+    );
+  `);
+  await db.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_firebase_uid
+    ON users(firebase_uid) WHERE firebase_uid IS NOT NULL;
+  `);
+  console.log("✅ Postgres schema ready.");
+}
+
+// ---------- Email ----------
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD },
+});
 transporter.verify((err) => {
   if (err) console.error("❌ Email transporter could NOT connect:", err.message);
   else console.log("✅ Gmail SMTP connected — emails will send.");
 });
-
 async function sendEmail(to, subject, html) {
   try {
     const info = await transporter.sendMail({ from: process.env.GMAIL_USER, to, subject, html });
@@ -111,10 +132,10 @@ async function sendEmail(to, subject, html) {
   }
 }
 
-// ---------- Job fetching (free — Arbeitnow public API, no key) ----------
+// ---------- Job fetching ----------
 async function fetchLatestJobs() {
   const res = await axios.get("https://www.arbeitnow.com/api/job-board-api");
-  return res.data.data; // array of { slug, title, company_name, location, url, description, remote, tags... }
+  return res.data.data;
 }
 
 // ---------- Matching ----------
@@ -122,9 +143,7 @@ function jobMatchesUser(job, user) {
   const keywords = user.role_keywords.toLowerCase().split(",").map(k => k.trim()).filter(Boolean);
   const haystack = `${job.title} ${job.tags?.join(" ") || ""}`.toLowerCase();
   const keywordMatch = keywords.some(k => haystack.includes(k));
-
   if (!keywordMatch) return false;
-
   if (user.location) {
     const loc = user.location.toLowerCase();
     const jobLoc = (job.location || "").toLowerCase();
@@ -134,12 +153,19 @@ function jobMatchesUser(job, user) {
   return true;
 }
 
-function alreadySent(userId, jobSlug) {
-  return !!db.prepare("SELECT 1 FROM sent_jobs WHERE user_id = ? AND job_slug = ?").get(userId, jobSlug);
+async function alreadySent(userId, jobSlug) {
+  const { rows } = await db.query(
+    "SELECT 1 FROM sent_jobs WHERE user_id = $1 AND job_slug = $2",
+    [userId, jobSlug]
+  );
+  return rows.length > 0;
 }
 
-function markSent(userId, jobSlug) {
-  db.prepare("INSERT OR IGNORE INTO sent_jobs (user_id, job_slug) VALUES (?, ?)").run(userId, jobSlug);
+async function markSent(userId, jobSlug) {
+  await db.query(
+    "INSERT INTO sent_jobs (user_id, job_slug) VALUES ($1, $2) ON CONFLICT (user_id, job_slug) DO NOTHING",
+    [userId, jobSlug]
+  );
 }
 
 function jobEmailHtml(jobs) {
@@ -155,9 +181,12 @@ function jobEmailHtml(jobs) {
   `;
 }
 
-// ---------- Core: match a pre-fetched job list against one user, and email if needed ----------
 async function notifyUserFromJobs(user, jobs) {
-  const matches = jobs.filter(j => jobMatchesUser(j, user) && !alreadySent(user.id, j.slug));
+  const candidates = jobs.filter(j => jobMatchesUser(j, user));
+  const matches = [];
+  for (const j of candidates) {
+    if (!(await alreadySent(user.id, j.slug))) matches.push(j);
+  }
   let sent = false;
   if (matches.length > 0) {
     sent = await sendEmail(
@@ -165,22 +194,18 @@ async function notifyUserFromJobs(user, jobs) {
       `${matches.length} new job match(es) for "${user.role_keywords}"`,
       jobEmailHtml(matches)
     );
-    if (sent) matches.forEach(j => markSent(user.id, j.slug));
+    if (sent) for (const j of matches) await markSent(user.id, j.slug);
   }
   return { matches: matches.length, emailed: sent };
 }
 
-// ---------- Core: check jobs and notify one user (fetches fresh — used by manual "Check now") ----------
 async function checkAndNotifyUser(user) {
   const jobs = await fetchLatestJobs();
   return notifyUserFromJobs(user, jobs);
 }
 
-// ---------- Core: check jobs and notify everyone on a plan (used by cron) ----------
-// Fetches the job list ONCE per run and reuses it for every subscriber on this
-// frequency, instead of re-fetching per user.
 async function checkAndNotifyAll(frequencyFilter) {
-  const users = db.prepare("SELECT * FROM users WHERE frequency = ?").all(frequencyFilter);
+  const { rows: users } = await db.query("SELECT * FROM users WHERE frequency = $1", [frequencyFilter]);
   if (users.length === 0) return { checked: 0, notified: 0 };
 
   const jobs = await fetchLatestJobs();
@@ -194,13 +219,10 @@ async function checkAndNotifyAll(frequencyFilter) {
 
 // ---------- Routes ----------
 
-// Preview matches for a role/location without saving anything — no login required,
-// this reads nobody's data and just filters the live job feed on the fly.
 app.get("/api/preview", async (req, res) => {
   const role_keywords = (req.query.role_keywords || "").toString();
   const location = (req.query.location || "").toString();
   if (!role_keywords) return res.status(400).json({ error: "role_keywords is required" });
-
   try {
     const jobs = await fetchLatestJobs();
     const fakeUser = { role_keywords, location };
@@ -212,74 +234,258 @@ app.get("/api/preview", async (req, res) => {
   }
 });
 
-// Sign up / update job alert preferences — tied to the logged-in Firebase account.
-// Email comes from the verified token, never from the request body, so nobody can
-// create or edit another person's subscription.
 app.post("/api/subscribe", requireAuth, async (req, res) => {
   const { role_keywords, location } = req.body;
-  const email = req.user.email;
+  const identity = identityOf(req.user);
   const uid = req.user.uid;
-  if (!email) return res.status(400).json({ error: "Your account has no email on file." });
+  if (!identity) return res.status(400).json({ error: "Your account has no email or phone number on file." });
   if (!role_keywords) return res.status(400).json({ error: "role_keywords is required" });
 
-  db.prepare(`
+  await db.query(`
     INSERT INTO users (email, firebase_uid, role_keywords, location)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(email) DO UPDATE SET
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (email) DO UPDATE SET
       firebase_uid = excluded.firebase_uid,
       role_keywords = excluded.role_keywords,
       location = excluded.location
-  `).run(email, uid, role_keywords, location || "");
+  `, [identity, uid, role_keywords, location || ""]);
 
   res.json({ success: true, message: "Preferences saved. You'll get daily job alerts by email." });
 });
 
-// Upgrade to paid plan (Rs 49/month) — payment gateway plug-in point.
-// Wire Razorpay's checkout here later; for now this flips the flag after a mock "payment",
-// but only for the account that is actually logged in.
-app.post("/api/upgrade", requireAuth, (req, res) => {
-  const email = req.user.email;
-  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
-  if (!user) return res.status(404).json({ error: "Subscribe first, then upgrade." });
+app.post("/api/create-checkout-session", requireAuth, async (req, res) => {
+  const identity = identityOf(req.user);
+  const { rows } = await db.query("SELECT * FROM users WHERE email = $1", [identity]);
+  const user = rows[0];
+  if (!user) return res.status(404).json({ error: "Subscribe with a role first, then upgrade." });
 
-  db.prepare("UPDATE users SET is_subscribed = 1, frequency = 'instant' WHERE email = ?").run(email);
-  res.json({ success: true, message: "Upgraded! You'll now get instant alerts instead of the daily digest." });
+  try {
+    const customerId = user.stripe_customer_id;
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer_email: customerId ? undefined : (req.user.email || undefined),
+      customer: customerId || undefined,
+      line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
+      success_url: `${process.env.APP_URL}/?payment=success`,
+      cancel_url: `${process.env.APP_URL}/?payment=cancelled`,
+      metadata: { app_user_id: String(user.id), identity },
+      subscription_data: { metadata: { app_user_id: String(user.id), identity } },
+    });
+    res.json({ success: true, url: session.url });
+  } catch (err) {
+    console.error("Create checkout session failed:", err.message);
+    res.status(502).json({ error: "Couldn't start checkout. Try again shortly." });
+  }
 });
 
-// Unsubscribe — deletes preferences and send history for the logged-in account.
-app.post("/api/unsubscribe", requireAuth, (req, res) => {
-  const email = req.user.email;
-  const user = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
+app.post("/api/cancel-subscription", requireAuth, async (req, res) => {
+  const identity = identityOf(req.user);
+  const { rows } = await db.query("SELECT * FROM users WHERE email = $1", [identity]);
+  const user = rows[0];
+  if (!user || !user.stripe_subscription_id) {
+    return res.status(404).json({ error: "No active paid subscription found." });
+  }
+  try {
+    await stripe.subscriptions.cancel(user.stripe_subscription_id);
+    await db.query(
+      "UPDATE users SET is_subscribed = 0, frequency = 'daily', subscription_status = 'cancelled' WHERE id = $1",
+      [user.id]
+    );
+    res.json({ success: true, message: "Subscription cancelled. You're back on the free daily digest." });
+  } catch (err) {
+    console.error("Cancel subscription failed:", err.message);
+    res.status(502).json({ error: "Couldn't cancel right now. Try again shortly." });
+  }
+});
+
+app.post("/api/stripe-webhook", async (req, res) => {
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.rawBody,
+      req.headers["stripe-signature"],
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error("❌ Webhook signature verification failed:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  console.log(`↪️  Stripe webhook: ${event.type}`);
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+    const userId = session.metadata?.app_user_id;
+    if (userId) {
+      await db.query(
+        "UPDATE users SET stripe_customer_id = $1, stripe_subscription_id = $2, subscription_status = 'created' WHERE id = $3",
+        [session.customer, session.subscription, userId]
+      );
+    }
+  }
+
+  if (event.type === "invoice.paid") {
+    const invoice = event.data.object;
+    const subscriptionId = invoice.subscription;
+    if (subscriptionId) {
+      const { rows } = await db.query("SELECT * FROM users WHERE stripe_subscription_id = $1", [subscriptionId]);
+      const user = rows[0];
+      if (user) {
+        await db.query(
+          "UPDATE users SET is_subscribed = 1, frequency = 'instant', subscription_status = 'active' WHERE id = $1",
+          [user.id]
+        );
+        console.log(`✅ ${user.email} upgraded to Express Mail (instant) after successful payment.`);
+      }
+    }
+  }
+
+  if (event.type === "customer.subscription.deleted" || event.type === "invoice.payment_failed") {
+    const obj = event.data.object;
+    const subscriptionId = obj.subscription || obj.id;
+    const { rows } = await db.query("SELECT * FROM users WHERE stripe_subscription_id = $1", [subscriptionId]);
+    const user = rows[0];
+    if (user) {
+      const status = event.type === "invoice.payment_failed" ? "payment_failed" : "cancelled";
+      await db.query(
+        "UPDATE users SET is_subscribed = 0, frequency = 'daily', subscription_status = $1 WHERE id = $2",
+        [status, user.id]
+      );
+      console.log(`⬇️  ${user.email} downgraded to Surface Mail (daily) — ${event.type}.`);
+    }
+  }
+
+  res.json({ received: true });
+});
+
+app.post("/api/unsubscribe", requireAuth, async (req, res) => {
+  const identity = identityOf(req.user);
+  const { rows } = await db.query("SELECT * FROM users WHERE email = $1", [identity]);
+  const user = rows[0];
   if (!user) return res.status(404).json({ error: "No subscription found for this account." });
 
-  db.prepare("DELETE FROM sent_jobs WHERE user_id = ?").run(user.id);
-  db.prepare("DELETE FROM users WHERE id = ?").run(user.id);
+  if (user.stripe_subscription_id && user.subscription_status === "active") {
+    try { await stripe.subscriptions.cancel(user.stripe_subscription_id); }
+    catch (err) { console.error("Stripe cancel during unsubscribe failed:", err.message); }
+  }
+
+  await db.query("DELETE FROM sent_jobs WHERE user_id = $1", [user.id]);
+  await db.query("DELETE FROM users WHERE id = $1", [user.id]);
   res.json({ success: true, message: "Unsubscribed. Your preferences and history were deleted." });
 });
 
-// Manually trigger a check for the LOGGED-IN user only (handy for testing without
-// waiting for the cron, and without spamming every other user on the platform).
 app.post("/api/check-now", requireAuth, async (req, res) => {
-  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(req.user.email);
+  const identity = identityOf(req.user);
+  const { rows } = await db.query("SELECT * FROM users WHERE email = $1", [identity]);
+  const user = rows[0];
   if (!user) return res.status(404).json({ error: "Subscribe first." });
   const result = await checkAndNotifyUser(user);
   res.json({ checked: 1, ...result });
 });
 
-// Status — only ever returns the logged-in user's own record.
-app.get("/api/status", requireAuth, (req, res) => {
-  const user = db.prepare(
-    "SELECT email, role_keywords, location, is_subscribed, frequency FROM users WHERE email = ?"
-  ).get(req.user.email);
+app.get("/api/status", requireAuth, async (req, res) => {
+  const identity = identityOf(req.user);
+  const { rows } = await db.query(
+    "SELECT email, role_keywords, location, is_subscribed, frequency, subscription_status FROM users WHERE email = $1",
+    [identity]
+  );
+  const user = rows[0];
   if (!user) return res.status(404).json({ error: "Not subscribed yet." });
   res.json(user);
 });
 
-// ---------- Cron schedules (batch jobs, unaffected by auth) ----------
-// Paid users: check every 15 min for near-instant alerts
-cron.schedule("*/15 * * * *", () => checkAndNotifyAll("instant").catch(console.error));
-// Free users: once a day at 9am server time
-cron.schedule("0 9 * * *", () => checkAndNotifyAll("daily").catch(console.error));
+app.get("/api/profile", requireAuth, async (req, res) => {
+  const identity = identityOf(req.user);
+  const { rows } = await db.query(
+    "SELECT id, email, role_keywords, location, is_subscribed, frequency, subscription_status, created_at FROM users WHERE email = $1",
+    [identity]
+  );
+  const user = rows[0];
+  if (!user) return res.status(404).json({ error: "Not subscribed yet." });
+
+  const { rows: countRows } = await db.query("SELECT COUNT(*) AS c FROM sent_jobs WHERE user_id = $1", [user.id]);
+  const alertsSent = parseInt(countRows[0].c, 10);
+
+  res.json({
+    email: user.email,
+    role_keywords: user.role_keywords,
+    location: user.location,
+    is_subscribed: !!user.is_subscribed,
+    verified: !!user.is_subscribed,
+    frequency: user.frequency,
+    subscription_status: user.subscription_status,
+    member_since: user.created_at,
+    alerts_sent: alertsSent,
+  });
+});
+
+app.post("/api/resume/generate", requireAuth, async (req, res) => {
+  const identity = identityOf(req.user);
+  const { rows } = await db.query("SELECT * FROM users WHERE email = $1", [identity]);
+  const user = rows[0];
+  if (!user) return res.status(404).json({ error: "not_subscribed", message: "Subscribe with a role first." });
+  if (!user.is_subscribed) {
+    return res.status(403).json({ error: "express_only", message: "AI Resume Builder is only available to Express Mail members." });
+  }
+
+  const { full_name, target_role, experience, skills, education } = req.body;
+  if (!target_role || !experience) {
+    return res.status(400).json({ error: "target_role and experience are required." });
+  }
+
+  const prompt = `Write a concise, ATS-friendly, one-page resume in plain text (no markdown symbols) for this candidate. Use clear section headings (SUMMARY, EXPERIENCE, SKILLS, EDUCATION) in capitals, and keep bullet points action-oriented and quantified where possible.
+
+Name: ${full_name || "Candidate"}
+Target role: ${target_role}
+Experience: ${experience}
+Skills: ${skills || "Not specified — infer reasonable ones from the target role and experience."}
+Education: ${education || "Not specified."}`;
+
+  try {
+    const response = await axios.post(
+      "https://api.anthropic.com/v1/messages",
+      { model: "claude-sonnet-4-6", max_tokens: 1500, messages: [{ role: "user", content: prompt }] },
+      { headers: { "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" } }
+    );
+    const resumeText = response.data.content.map(block => block.text || "").join("\n");
+    res.json({ success: true, resume: resumeText });
+  } catch (err) {
+    console.error("Resume generation failed:", err.response?.data || err.message);
+    res.status(502).json({ error: "generation_failed", message: "Couldn't generate the resume right now. Try again shortly." });
+  }
+});
+
+// ---------- Cron trigger endpoints (called by an external pinger, e.g. cron-job.org) ----------
+// GET so a simple scheduled HTTP-GET service can call them directly.
+// Protected by CRON_SECRET so nobody else can trigger mass emails on demand.
+app.get("/api/cron/check-instant", requireCronSecret, async (req, res) => {
+  try {
+    const result = await checkAndNotifyAll("instant");
+    console.log("⏱️  Cron (instant):", result);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error("Cron (instant) failed:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/cron/check-daily", requireCronSecret, async (req, res) => {
+  try {
+    const result = await checkAndNotifyAll("daily");
+    console.log("⏱️  Cron (daily):", result);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error("Cron (daily) failed:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Job Alerts running on http://localhost:${PORT}`));
+initDb()
+  .then(() => {
+    app.listen(PORT, () => console.log(`Job Alerts running on http://localhost:${PORT}`));
+  })
+  .catch((err) => {
+    console.error("❌ Failed to initialize database:", err.message);
+    process.exit(1);
+  });
